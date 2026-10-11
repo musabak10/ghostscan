@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
-from .services import HTTP_PORTS, service_name
+from .fingerprint import CANONICAL_PORT, detect_version, guess_service
+from .services import HTTP_PORTS, port_info, service_name
 
 MAX_HOSTS = 1024
 
@@ -21,6 +22,9 @@ class PortResult:
     service: str
     banner: Optional[str] = None
     latency_ms: Optional[float] = None
+    version: Optional[str] = None
+    risk: str = "info"
+    description: str = ""
 
 
 def parse_ports(spec: str) -> list[int]:
@@ -68,7 +72,9 @@ async def _grab_banner(reader, writer, host: str, port: int, timeout: float) -> 
     return " ".join(text.split())[:120] or None
 
 
-async def probe(host: str, port: int, timeout: float, banner: bool) -> Optional[PortResult]:
+async def probe(
+    host: str, port: int, timeout: float, banner: bool, lang: str = "en"
+) -> Optional[PortResult]:
     """Try one TCP connect. Returns a PortResult only if the port is open."""
     start = time.perf_counter()
     try:
@@ -82,7 +88,18 @@ async def probe(host: str, port: int, timeout: float, banner: bool) -> Optional[
         await writer.wait_closed()
     except OSError:
         pass
-    return PortResult(host, port, "open", service_name(port), text, round(latency, 2))
+
+    service, info_port, version = service_name(port), port, None
+    if text:
+        version = detect_version(text)
+        guessed = guess_service(text)
+        # Trust the banner only when it contradicts the port number (e.g. SSH on port 2222).
+        if guessed and not service.startswith(guessed):
+            service, info_port = guessed, CANONICAL_PORT[guessed]
+    risk, description = port_info(info_port, lang)
+    return PortResult(
+        host, port, "open", service, text, round(latency, 2), version, risk, description
+    )
 
 
 async def scan(
@@ -91,13 +108,14 @@ async def scan(
     timeout: float = 1.0,
     concurrency: int = 500,
     banner: bool = False,
+    lang: str = "en",
 ) -> AsyncIterator[PortResult]:
     """Scan hosts x ports and yield open ports as soon as they are found."""
     sem = asyncio.Semaphore(concurrency)
 
     async def worker(h: str, p: int) -> Optional[PortResult]:
         async with sem:
-            return await probe(h, p, timeout, banner)
+            return await probe(h, p, timeout, banner, lang)
 
     tasks = [asyncio.ensure_future(worker(h, p)) for h in hosts for p in ports]
     try:
